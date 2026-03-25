@@ -48,25 +48,34 @@ export default async function handler(req, res) {
 
     console.log(`[webhook] Message from ${customerPhone} to ${tenantPhone}: "${messageText}"`);
 
+    // ── Load tenant ───────────────────────────────────────
     const tenant = await getTenant(tenantPhone);
     if (!tenant || !tenant.active) {
       console.warn(`[webhook] No active tenant for ${tenantPhone}`);
       return;
     }
+    console.log(`[webhook] Tenant found: ${tenant.businessName}`);
 
+    // ── Load or create conversation ───────────────────────
     let conv = await getConversation(tenantPhone, customerPhone);
+    console.log(`[webhook] Conversation: ${conv ? conv.stage : "none — creating"}`);
+
     if (!conv) {
       conv = await createConversation(tenantPhone, customerPhone, customerName);
+      console.log(`[webhook] Conversation created — sending greeting`);
       await sendWhatsAppMessage(tenantPhone, customerPhone, tenant.greeting, tenant);
+      console.log(`[webhook] Greeting sent`);
       await addMessage(tenantPhone, customerPhone, "assistant", tenant.greeting);
     }
 
     await addMessage(tenantPhone, customerPhone, "user", messageText);
     conv = await getConversation(tenantPhone, customerPhone);
+    console.log(`[webhook] Stage: ${conv.stage}`);
 
     // ── Stage: quoted ─────────────────────────────────────
     if (conv.stage === "quoted") {
       const intent = await detectIntent(messageText);
+      console.log(`[webhook] Intent: ${intent}`);
       if (intent === "confirm") {
         await handleQuoteAccepted({ conv, tenant, tenantPhone, customerPhone });
       } else if (intent === "reject") {
@@ -82,6 +91,7 @@ export default async function handler(req, res) {
     // ── Stage: confirming ─────────────────────────────────
     if (conv.stage === "confirming") {
       const intent = await detectIntent(messageText);
+      console.log(`[webhook] Intent: ${intent}`);
       if (intent === "confirm") {
         await handleSendQuote({ conv, tenant, tenantPhone, customerPhone });
       } else {
@@ -95,7 +105,9 @@ export default async function handler(req, res) {
     }
 
     // ── Stage: greeting / qualifying ──────────────────────
+    console.log(`[webhook] Running GPT qualifier`);
     const { reply, readyToQuote, jobDetails } = await continueConversation(conv, tenant);
+    console.log(`[webhook] GPT done — readyToQuote: ${readyToQuote}`);
 
     if (readyToQuote) {
       await advanceStage(tenantPhone, customerPhone, "confirming", {
@@ -109,10 +121,12 @@ export default async function handler(req, res) {
       await advanceStage(tenantPhone, customerPhone, "qualifying");
       await sendWhatsAppMessage(tenantPhone, customerPhone, reply, tenant);
       await addMessage(tenantPhone, customerPhone, "assistant", reply);
+      console.log(`[webhook] Reply sent: "${reply.slice(0, 60)}"`);
     }
 
   } catch (err) {
-    console.error("[webhook] Error:", err);
+    console.error("[webhook] Error:", err.message);
+    console.error("[webhook] Stack:", err.stack);
   }
 }
 
