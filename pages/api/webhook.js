@@ -28,15 +28,18 @@ export default async function handler(req, res) {
 
   if (req.method !== "POST") return res.status(405).end();
 
-  // Always return 200 immediately — Meta retries if you don't
-  res.status(200).json({ status: "ok" });
-
   try {
     const body = req.body;
-    if (body.object !== "whatsapp_business_account") return;
+
+    // Validate it's a WhatsApp message event
+    if (body.object !== "whatsapp_business_account") {
+      return res.status(200).json({ status: "ok" });
+    }
 
     const value = body.entry?.[0]?.changes?.[0]?.value;
-    if (!value?.messages?.[0]) return;
+    if (!value?.messages?.[0]) {
+      return res.status(200).json({ status: "ok" });
+    }
 
     const message       = value.messages[0];
     const tenantPhone   = value.metadata?.display_phone_number?.replace(/\D/g, "");
@@ -44,15 +47,18 @@ export default async function handler(req, res) {
     const messageText   = message.text?.body ?? "";
     const customerName  = value.contacts?.[0]?.profile?.name ?? null;
 
-    if (!tenantPhone || !customerPhone || !messageText) return;
+    if (!tenantPhone || !customerPhone || !messageText) {
+      return res.status(200).json({ status: "ok" });
+    }
 
     console.log(`[webhook] Message from ${customerPhone} to ${tenantPhone}: "${messageText}"`);
 
     // ── Load tenant ───────────────────────────────────────
+    console.log(`[webhook] Looking up tenant: ${tenantPhone}`);
     const tenant = await getTenant(tenantPhone);
     if (!tenant || !tenant.active) {
       console.warn(`[webhook] No active tenant for ${tenantPhone}`);
-      return;
+      return res.status(200).json({ status: "ok" });
     }
     console.log(`[webhook] Tenant found: ${tenant.businessName}`);
 
@@ -85,7 +91,7 @@ export default async function handler(req, res) {
         await sendWhatsAppMessage(tenantPhone, customerPhone, reply, tenant);
         await addMessage(tenantPhone, customerPhone, "assistant", reply);
       }
-      return;
+      return res.status(200).json({ status: "ok" });
     }
 
     // ── Stage: confirming ─────────────────────────────────
@@ -101,7 +107,7 @@ export default async function handler(req, res) {
         await sendWhatsAppMessage(tenantPhone, customerPhone, reply, tenant);
         await addMessage(tenantPhone, customerPhone, "assistant", reply);
       }
-      return;
+      return res.status(200).json({ status: "ok" });
     }
 
     // ── Stage: greeting / qualifying ──────────────────────
@@ -124,9 +130,12 @@ export default async function handler(req, res) {
       console.log(`[webhook] Reply sent: "${reply.slice(0, 60)}"`);
     }
 
+    return res.status(200).json({ status: "ok" });
+
   } catch (err) {
     console.error("[webhook] Error:", err.message);
     console.error("[webhook] Stack:", err.stack);
+    return res.status(200).json({ status: "ok" }); // always 200 to Meta
   }
 }
 
@@ -204,8 +213,6 @@ async function handleQuoteRejected({ conv, tenant, tenantPhone, customerPhone })
 
 // ─────────────────────────────────────────────────────────────
 // NOTIFY OWNER
-// tenant.phone = sending number (resolves token + phoneNumberId)
-// tenant.ownerPhone = destination
 // ─────────────────────────────────────────────────────────────
 
 async function notifyOwner(tenant, summary) {
