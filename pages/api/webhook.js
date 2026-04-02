@@ -31,7 +31,6 @@ export default async function handler(req, res) {
   try {
     const body = req.body;
 
-    // Validate it's a WhatsApp message event
     if (body.object !== "whatsapp_business_account") {
       return res.status(200).json({ status: "ok" });
     }
@@ -53,35 +52,26 @@ export default async function handler(req, res) {
 
     console.log(`[webhook] Message from ${customerPhone} to ${tenantPhone}: "${messageText}"`);
 
-    // ── Load tenant ───────────────────────────────────────
-    console.log(`[webhook] Looking up tenant: ${tenantPhone}`);
     const tenant = await getTenant(tenantPhone);
     if (!tenant || !tenant.active) {
       console.warn(`[webhook] No active tenant for ${tenantPhone}`);
       return res.status(200).json({ status: "ok" });
     }
-    console.log(`[webhook] Tenant found: ${tenant.businessName}`);
 
-    // ── Load or create conversation ───────────────────────
     let conv = await getConversation(tenantPhone, customerPhone);
-    console.log(`[webhook] Conversation: ${conv ? conv.stage : "none — creating"}`);
 
     if (!conv) {
       conv = await createConversation(tenantPhone, customerPhone, customerName);
-      console.log(`[webhook] Conversation created — sending greeting`);
       await sendWhatsAppMessage(tenantPhone, customerPhone, tenant.greeting, tenant);
-      console.log(`[webhook] Greeting sent`);
       await addMessage(tenantPhone, customerPhone, "assistant", tenant.greeting);
     }
 
     await addMessage(tenantPhone, customerPhone, "user", messageText);
     conv = await getConversation(tenantPhone, customerPhone);
-    console.log(`[webhook] Stage: ${conv.stage}`);
 
     // ── Stage: quoted ─────────────────────────────────────
     if (conv.stage === "quoted") {
       const intent = await detectIntent(messageText);
-      console.log(`[webhook] Intent: ${intent}`);
       if (intent === "confirm") {
         await handleQuoteAccepted({ conv, tenant, tenantPhone, customerPhone });
       } else if (intent === "reject") {
@@ -97,7 +87,6 @@ export default async function handler(req, res) {
     // ── Stage: confirming ─────────────────────────────────
     if (conv.stage === "confirming") {
       const intent = await detectIntent(messageText);
-      console.log(`[webhook] Intent: ${intent}`);
       if (intent === "confirm") {
         await handleSendQuote({ conv, tenant, tenantPhone, customerPhone });
       } else {
@@ -111,9 +100,7 @@ export default async function handler(req, res) {
     }
 
     // ── Stage: greeting / qualifying ──────────────────────
-    console.log(`[webhook] Running GPT qualifier`);
     const { reply, readyToQuote, jobDetails } = await continueConversation(conv, tenant);
-    console.log(`[webhook] GPT done — readyToQuote: ${readyToQuote}`);
 
     if (readyToQuote) {
       await advanceStage(tenantPhone, customerPhone, "confirming", {
@@ -127,15 +114,13 @@ export default async function handler(req, res) {
       await advanceStage(tenantPhone, customerPhone, "qualifying");
       await sendWhatsAppMessage(tenantPhone, customerPhone, reply, tenant);
       await addMessage(tenantPhone, customerPhone, "assistant", reply);
-      console.log(`[webhook] Reply sent: "${reply.slice(0, 60)}"`);
     }
 
     return res.status(200).json({ status: "ok" });
 
   } catch (err) {
-    console.error("[webhook] Error:", err.message);
-    console.error("[webhook] Stack:", err.stack);
-    return res.status(200).json({ status: "ok" }); // always 200 to Meta
+    console.error("[webhook] Error:", err.message, err.stack);
+    return res.status(200).json({ status: "ok" });
   }
 }
 
@@ -145,7 +130,13 @@ export default async function handler(req, res) {
 
 async function handleSendQuote({ conv, tenant, tenantPhone, customerPhone }) {
   const quoteRef = generateQuoteRef(tenant);
-  const { url, price } = await generateQuotePDF({ tenant, jobDetails: conv.jobDetails, quoteRef });
+
+  // generateQuotePDF now returns lineItems so we can reuse them on the invoice
+  const { url, price, lineItems } = await generateQuotePDF({
+    tenant,
+    jobDetails: conv.jobDetails,
+    quoteRef,
+  });
 
   await sendWhatsAppDocument(tenantPhone, customerPhone, url, `${quoteRef}.pdf`, tenant);
   await sendWhatsAppMessage(
@@ -158,33 +149,46 @@ async function handleSendQuote({ conv, tenant, tenantPhone, customerPhone }) {
     quoteId:     quoteRef,
     quoteUrl:    url,
     quotedPrice: price,
+    lineItems,                // ← stored so invoice can reuse the same line items
     quotedAt:    new Date().toISOString(),
   });
 
-  await notifyOwner(tenant, `New quote sent to ${conv.jobDetails.customerName ?? customerPhone}. Job: ${conv.jobDetails.service} — ${tenant.currency} ${price}`);
-  console.log(`[webhook] Quote sent: ${quoteRef} to ${customerPhone}`);
+  const priceDisplay = price > 0
+    ? `${tenant.currency} ${price.toLocaleString("en-ZA")}`
+    : "TBC";
+
+  await notifyOwner(tenant,
+    `New quote sent to ${conv.jobDetails.customerName ?? customerPhone}. ` +
+    `Job: ${conv.jobDetails.description ?? conv.jobDetails.service} — ${priceDisplay}`
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
-// HANDLE: Quote Accepted
+// HANDLE: Quote Accepted → generate invoice
 // ─────────────────────────────────────────────────────────────
 
 async function handleQuoteAccepted({ conv, tenant, tenantPhone, customerPhone }) {
   const invoiceRef = generateInvoiceRef(tenant);
+
   const { url } = await generateInvoicePDF({
     tenant,
     jobDetails:  conv.jobDetails,
     invoiceRef,
     quoteRef:    conv.quoteId,
     price:       conv.quotedPrice,
+    lineItems:   conv.lineItems,   // ← reuse line items from quote
   });
 
-  const deposit = (conv.quotedPrice / 2).toLocaleString("en-ZA", { minimumFractionDigits: 2 });
-  await sendWhatsAppMessage(
-    tenantPhone, customerPhone,
-    `Fantastic! Here's your invoice. A 50% deposit of ${tenant.currency} ${deposit} is required to confirm your booking.`,
-    tenant
-  );
+  const deposit = conv.quotedPrice > 0
+    ? (conv.quotedPrice / 2).toLocaleString("en-ZA", { minimumFractionDigits: 2 })
+    : null;
+
+  const depositMsg = deposit
+    ? `A 50% deposit of ${tenant.currency} ${deposit} is required to confirm your booking.`
+    : `The business will be in touch to confirm the final amount and deposit.`;
+
+  await sendWhatsAppMessage(tenantPhone, customerPhone,
+    `Fantastic! Here's your invoice. ${depositMsg}`, tenant);
   await sendWhatsAppDocument(tenantPhone, customerPhone, url, `${invoiceRef}.pdf`, tenant);
 
   await advanceStage(tenantPhone, customerPhone, "accepted", {
@@ -193,8 +197,10 @@ async function handleQuoteAccepted({ conv, tenant, tenantPhone, customerPhone })
     acceptedAt: new Date().toISOString(),
   });
 
-  await notifyOwner(tenant, `Quote ACCEPTED by ${conv.jobDetails.customerName ?? customerPhone}. Job: ${conv.jobDetails.service}. Invoice ${invoiceRef} sent. Amount: ${tenant.currency} ${conv.quotedPrice}`);
-  console.log(`[webhook] Invoice sent: ${invoiceRef} to ${customerPhone}`);
+  await notifyOwner(tenant,
+    `Quote ACCEPTED by ${conv.jobDetails.customerName ?? customerPhone}. ` +
+    `Job: ${conv.jobDetails.service}. Invoice ${invoiceRef} sent. Amount: ${tenant.currency} ${conv.quotedPrice}`
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -202,11 +208,8 @@ async function handleQuoteAccepted({ conv, tenant, tenantPhone, customerPhone })
 // ─────────────────────────────────────────────────────────────
 
 async function handleQuoteRejected({ conv, tenant, tenantPhone, customerPhone }) {
-  await sendWhatsAppMessage(
-    tenantPhone, customerPhone,
-    `No problem at all. If you'd like a quote in the future, just message us anytime.`,
-    tenant
-  );
+  await sendWhatsAppMessage(tenantPhone, customerPhone,
+    `No problem at all. If you'd like a quote in the future, just message us anytime.`, tenant);
   await advanceStage(tenantPhone, customerPhone, "rejected", { rejectedAt: new Date().toISOString() });
   await notifyOwner(tenant, `Quote declined by ${conv.jobDetails.customerName ?? customerPhone}. Job: ${conv.jobDetails.service}`);
 }
@@ -217,12 +220,8 @@ async function handleQuoteRejected({ conv, tenant, tenantPhone, customerPhone })
 
 async function notifyOwner(tenant, summary) {
   try {
-    await sendWhatsAppMessage(
-      tenant.phone,
-      tenant.ownerPhone,
-      `Rebel Shap update:\n${summary}`,
-      tenant
-    );
+    await sendWhatsAppMessage(tenant.phone, tenant.ownerPhone,
+      `Rebel Shap update:\n${summary}`, tenant);
   } catch (err) {
     console.warn("[webhook] Owner notification failed:", err.message);
   }
